@@ -1,0 +1,27 @@
+{
+  "name": "kimi-codeserver-proxy",
+  "version": "0.1.0",
+  "description": "Base-path adapter so the official Kimi Code web UI (kimi web) works behind a self-hosted code-server's /proxy/<port>/ port forwarding.",
+  "type": "module",
+  "bin": {
+    "kimi-codeserver-proxy": "proxy.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "keywords": [
+    "kimi",
+    "kimi-cli",
+    "kimi-code",
+    "code-server",
+    "proxy",
+    "base-path",
+    "port-forwarding",
+    "reverse-proxy"
+  ],
+  "scripts": {
+    "start": "node proxy.js",
+    "test": "node --test \"tests/unit/*.test.mjs\" \"tests/integration/*.test.mjs\""
+  }
+}
