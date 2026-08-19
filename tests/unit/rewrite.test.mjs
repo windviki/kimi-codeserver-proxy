@@ -161,8 +161,8 @@ describe("normalizePath — base stripping for code-server forwarding", () => {
 describe("requestHeaders / responseHeaders — loopback impersonation", () => {
   test("rewrites Host/Origin to the loopback upstream", () => {
     const out = requestHeaders({
-      host: "code.aixyz.cloud",
-      origin: "https://code.aixyz.cloud",
+      host: "code.your-host.com",
+      origin: "https://code.your-host.com",
       "x-forwarded-for": "1.2.3.4",
       authorization: "Bearer t",
     });

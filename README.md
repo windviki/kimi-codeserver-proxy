@@ -1,114 +1,132 @@
 # kimi-codeserver-proxy
 
-Base-path 适配代理：让 [Kimi CLI](https://moonshotai.github.io/kimi-cli/) 的官方 Web UI（`kimi web`）能在**自部署的 code-server** 的端口转发下正常工作，浏览器里一点即达。
+**English** | [中文](README.zh-CN.md)
+
+Base-path adapter so the official [Kimi CLI](https://moonshotai.github.io/kimi-cli/) web UI (`kimi web`) works behind a **self-hosted code-server**'s port forwarding — one click in the browser, no manual URL fixing.
 
 ```
-你的浏览器
+Your browser
    │  https://code.your-host/proxy/3101/
    ▼
-code-server  (端口转发: 把 /proxy/3101/ 转发到本机 127.0.0.1:3101)
+code-server  (port forwarding: /proxy/3101/ -> 127.0.0.1:3101 on the host)
    ▼
-kimi-codeserver-proxy   (本工程: 监听 3101, 转发 + 重写)
+kimi-codeserver-proxy   (this project: listens on 3101, forwards + rewrites)
    ▼
-kimi web               (官方 UI, 绑定 127.0.0.1:58627, Bearer token 认证)
+kimi web               (official UI, bound to 127.0.0.1:58627, Bearer-token auth)
 ```
 
-## 背景：为什么要这个代理
+## Why this proxy exists
 
-`kimi web` 是**本地优先**的 Web 服务：
+`kimi web` is a **local-first** web service:
 
-- 它只绑定 loopback（`127.0.0.1:58627`），默认只给本机浏览器用；
-- 它有一个 **DNS-rebinding Host 检查**：任何非 loopback 的 `Host` 都返回 `403`——即便你设了 `KIMI_CODE_ALLOWED_HOSTS` 放行 code-server 域名，SPA 也打不开；
-- 它输出的前端资源（HTML/JS/CSS）全部是**根绝对路径**（`/assets/...`、`/favicon.ico`），而 JS 里的 API/WebSocket 地址又从 `window.location.origin` 出发拼 `api/v1/...`。
+- it only binds loopback (`127.0.0.1:58627`), intended for a local browser;
+- it enforces a **DNS-rebinding Host check** — any non-loopback `Host` gets `403`, so even setting `KIMI_CODE_ALLOWED_HOSTS` to allow your code-server domain is not enough for the SPA to load;
+- the frontend resources it serves are **root-absolute paths** (`/assets/...`, `/boot.js`, `/favicon.ico`), and its JS derives the REST/WS base from `window.location.origin`.
 
-而 code-server 的端口转发把服务挂载在 `https://host/proxy/<port>/` 这个**子路径**下。于是浏览器打开转发地址后，页面里的 `/assets/...` 被解析到主机根路径，API 请求也打到 `https://host/api/v1/...` 而不是转发子树——整个 SPA 加载不出来。
+code-server's port forwarding mounts the service under a **sub-path** — `https://host/proxy/<port>/`. When the browser loads the forwarded address, those `/assets/...` references resolve to `https://host/assets/...` (the host root) instead of `/proxy/<port>/assets/...`, and API/WS calls go to `https://host/api/v1/...` — the SPA never loads.
 
-本工程就是架在两者之间的适配器：**它转发一切到 kimi web，同时改写 HTML/JS/CSS 里的根绝对引用和 origin 推导逻辑，统一加上 `/proxy/<port>/` 前缀**，让 UI 在 code-server 下开箱即用。
+This project is the adapter in between: **it forwards everything to kimi web and rewrites the served HTML/JS/CSS so every root-absolute reference and the origin derivation are prefixed with `/proxy/<port>/`**, making the UI work out of the box under code-server.
 
-## 它还解决的三件事
+## What else it fixes
 
-1. **DNS-rebinding Host 栅栏**。代理把每个请求的 `Host`/`Origin` 改写成 loopback 上游（`127.0.0.1:58627`），绕过 Host 检查，等价于本机浏览器直连，无需 `KIMI_CODE_ALLOWED_HOSTS`。同时剥离 `x-forwarded-*` 转发痕迹。
-2. **前端 origin 解析**。Kimi 前端从 `window.location.origin` 推导 API/WS 地址，代理在 JS bundle 的 `Wke()` 函数里注入 base 前缀（`window.location.origin+"/proxy/3101"`），让 `api/v1/...` 和 `/api/v1/ws` 落到转发子树。
-3. **token 认证**。kimi 的 token 通过 URL fragment（`#token=`）进入前端，再以 `Authorization: Bearer` 头 / `kimi-code.bearer.<token>` WS subprotocol 上行。代理原样透传，并在启动/`url` 命令时从 `~/.kimi-code/server.token` 读出 token 拼出可点击的访问地址。
+1. **DNS-rebinding Host fence.** The proxy rewrites each request's `Host`/`Origin` to the loopback upstream (`127.0.0.1:58627`), satisfying kimi's Host check exactly like a local browser direct-connect — no `KIMI_CODE_ALLOWED_HOSTS` needed. `x-forwarded-*` forwarding traces are stripped.
+2. **Frontend origin derivation.** kimi's JS computes the API/WS base from `window.location.origin`; the proxy injects the base path into the bundle's `Wke()` expression (`window.location.origin+"/proxy/3101"`), so `api/v1/...` and `/api/v1/ws` land on the forwarded subtree.
+3. **Token authentication.** kimi's token enters the frontend via the URL fragment (`#token=`), then travels up as `Authorization: Bearer` / `kimi-code.bearer.<token>` WS subprotocol. The proxy passes it through verbatim and prints a clickable access URL (token included) on startup / via the `url` service command.
 
-## 快速开始
+## Quick start
 
-前置要求：
+Prerequisites:
 
 - Node.js >= 18
-- 已安装 `kimi` CLI（本代理可以替你拉起 `kimi web`；或者你自己单独起好）
-- 一个自部署的 code-server，并配置好端口转发
+- the `kimi` CLI installed (the proxy can spawn `kimi web` for you; alternatively run kimi yourself)
+- a self-hosted code-server with port forwarding configured
 
-### 1. 配置
+### 1. Configure
 
 ```bash
 cp .env.example .env
-# 按需编辑 .env
+# edit .env if needed
 ```
 
-### 2. 启动
+### 2. Start
 
 ```bash
 ./kimi-service.sh start
-# 或直接: node proxy.js
+# or directly: node proxy.js
 ```
 
-代理默认监听 `3101`。若上游 `127.0.0.1:58627` 没有 kimi web，它会自动 `spawn` 一个 `kimi web --port 58627 --no-open` 并沿用 `~/.kimi-code/server.token`。
+The proxy listens on `3101` by default. If no kimi web is reachable at `127.0.0.1:58627`, it automatically spawns `kimi web --port 58627 --no-open` reusing the persisted token from `~/.kimi-code/server.token`.
 
-### 3. 在 code-server 里开启端口转发
+### 3. Forward the port in code-server
 
-在 code-server 中把本机端口 `3101` 转发出去，转发地址形如：
+Forward host port `3101` in code-server. The forwarding address looks like:
 
 ```
 https://code.your-host/proxy/3101/
 ```
 
-浏览器打开这个地址即进入 Kimi Web UI（`#token=` 已自动携带）。
+Open that address in a browser to enter the Kimi web UI (the `#token=` fragment is carried automatically).
 
-## 服务脚本
+## Service script
 
 ```bash
-./kimi-service.sh start      # 启动 proxy（自动拉起 kimi web）
-./kimi-service.sh stop       # 停止 proxy + kimi web
-./kimi-service.sh restart    # 重启
-./kimi-service.sh status     # 查看 proxy / kimi web 状态
-./kimi-service.sh url        # 打印 code-server 下的访问地址（含 token）
-./kimi-service.sh logs       # 跟踪 proxy 日志（Ctrl-C 退出）
+./kimi-service.sh start      # start the proxy (auto-spawns kimi web)
+./kimi-service.sh stop       # stop proxy + kimi web
+./kimi-service.sh restart    # restart
+./kimi-service.sh status     # show proxy / kimi web status
+./kimi-service.sh url        # print the code-server access URL (token included)
+./kimi-service.sh logs       # tail the proxy log (Ctrl-C to quit)
 ```
 
-## 配置项
+## Configuration
 
-所有配置可通过环境变量或 `.env` 设置（`.env` 已 gitignore，请勿提交）。
+All settings can be provided via environment variables or a `.env` file (`.env` is gitignored — never commit it).
 
-| 变量 | 默认值 | 说明 |
+| Variable | Default | Description |
 | --- | --- | --- |
-| `PROXY_BASE` | `/proxy/3101` | 代理在 code-server 下被访问的 base 路径，即端口转发挂载的子树 |
-| `PROXY_PORT` | `3101` | 代理自己监听的端口 |
-| `PROXY_UPSTREAM_HOST` | `127.0.0.1` | kimi web 所在主机 |
-| `PROXY_UPSTREAM_PORT` | `58627` | kimi web 端口 |
-| `PROXY_SPAWN_KIMI` | `1` | 设为 `0` 时不自动拉起 `kimi web`（例如 kimi 由 systemd/pm2 托管） |
-| `PROXY_EXTERNAL_HOST` | 空 | 设为 code-server 域名后，脚本会打印完整可点击的访问地址 |
+| `PROXY_BASE` | `/proxy/3101` | Base path under which the proxy is reached on code-server, i.e. the forwarded subtree |
+| `PROXY_PORT` | `3101` | Port the proxy itself listens on |
+| `PROXY_UPSTREAM_HOST` | `127.0.0.1` | Host where kimi web is running |
+| `PROXY_UPSTREAM_PORT` | `58627` | Port of kimi web |
+| `PROXY_SPAWN_KIMI` | `1` | Set to `0` to disable auto-spawning `kimi web` (e.g. when kimi is managed by systemd/pm2) |
+| `PROXY_EXTERNAL_HOST` | empty | Set to your code-server hostname to have the scripts print a full clickable access URL |
 
-## 工作原理
+## How it works
 
-- **改写 HTML/JS/CSS**：只在 `200` 响应且 `content-type` 为 HTML / JavaScript / CSS 时执行。HTML 里根绝对引用（`/boot.js`、`/assets/...`、`/favicon.ico`）统一加上 base 前缀；JS 里先 patch 掉 origin 推导函数 `Wke()`（注入 `window.location.origin+"<base>"`），再把 4 处根绝对 `/assets/` 引用加前缀；CSS 里 `url(/assets/...)` 加前缀，`data:` 内联不受影响。base 插在开引号之后，双引号、单引号都覆盖，改写后仍是合法 HTML/JS/CSS。
-- **懒加载 chunk 无需改写**：Vite 的动态 `import("./chunk.js")` 用相对路径，天然落在 base 子树下。
-- **其余响应零缓冲透传**：二进制、JSON API、重定向、错误响应等直接管道转发，不整包缓冲进内存。
-- **请求头**：`Host`/`Origin` 改写成 loopback 上游；剥离 `hop-by-hop` 头与 `x-forwarded-*` 转发痕迹；强制 `accept-encoding: identity` 保证可做字节级改写。
-- **WebSocket**：`/api/v1/ws` 的 `101` 升级头（含 `Sec-WebSocket-Protocol`）原样透传，token subprotocol 经过 base 子树正常握手。
-- **错误安全**：上游失联返回 `502`；客户端中途断连、RST、WS 升级失败都不致代理进程崩溃。
-- **优雅退出**：收到 `SIGINT`/`SIGTERM` 时关闭监听并结束由代理拉起的 `kimi web`，不留孤儿进程。
+- **HTML/JS/CSS rewriting** is applied only to `200` responses with `content-type` of HTML, JavaScript, CSS or a Web App Manifest. Root-absolute references (`/boot.js`, `/assets/...`, `/favicon.ico`) are prefixed with the base path after the opening quote, in both double-quoted and single-quoted forms, so the rewritten string stays well-formed. CSS `url(/assets/...)` refs are prefixed; `data:` inline URLs are left alone.
+- **Lazy-loaded chunks need no rewrite.** Vite's dynamic `import("./chunk.js")` resolves relative to the module URL, so chunks land naturally under the base subtree.
+- **Everything else streams through untouched** — binaries, JSON, redirects and error responses are piped without being buffered in memory.
+- **Request headers.** `Host`/`Origin` are rewritten to the loopback upstream; hop-by-hop headers and `x-forwarded-*` forwarding traces are stripped; `accept-encoding: identity` is forced so the bytes can be rewritten.
+- **WebSocket.** `/api/v1/ws` upgrade headers (including `Sec-WebSocket-Protocol`) are forwarded verbatim, so the token subprotocol handshake works through the base-prefixed subtree.
+- **Error safety.** An unreachable upstream returns `502`; client disconnects, RSTs and failed WS upgrades are handled without crashing the process.
+- **Graceful shutdown.** `SIGINT`/`SIGTERM` close the listener and terminate a spawned `kimi web`, so no orphan process is left behind.
 
-## 测试
+## Version applicability & resource patching
+
+The proxy performs two kinds of rewriting, with different sensitivities to kimi frontend versions:
+
+1. **Version-agnostic prefix rewriting (HTML/CSS/JS).** Root-absolute asset references are prefixed by plain string substitution. These references are structural, not version-specific, so this part keeps working across kimi versions regardless of bundle hashes.
+2. **Bundle-specific JS patch (`Wke()` origin derivation).** To make API/WS calls land on the forwarded subtree, the proxy rewrites the minified expression inside kimi's origin-resolution function. The match targets a specific minified string.
+
+**Verified against: Kimi Code `0.37.2`** — server `server_version: 0.37.2`, frontend bundle `index-yKYHPeXU.js` / `index-DBtc5buz.css`.
+
+**If a future kimi version changes the bundle:** the patch match fails and the proxy prints a WARN on startup (`origin-resolution pattern was not found`) — it never silently ships a broken UI. Then:
+
+1. **Quick workaround:** open the UI with `?kimi_origin=<code-server base URL>` in the address — kimi's frontend natively reads this query parameter and persists it in `sessionStorage`, so API/WS calls reach the right origin without any patch.
+2. **Proper fix:** update `WKE_QUOTED` / `WKE_PATCH_RE` in `proxy.js` to match the new minified expression, and add a matching fixture under `tests/fixtures/` so the regression is covered by a test.
+
+Asset filenames with content hashes (`index-*.js`) are never matched by the proxy, so they may change freely between builds.
+
+## Testing
 
 ```bash
 npm test
 ```
 
-- `tests/unit/`：改写逻辑单元测试（HTML/JS/CSS 前缀、`Wke` patch、路径归一化、请求/响应头）。
-- `tests/integration/`：全链路集成测试——以 mock 上游模拟 kimi 的 Host 检查与 token 认证，验证 base 改写、API 鉴权、二进制透传、Host 重写与 WS 握手。
-- `tests/helpers/`：mock 上游与 proxy 子进程启动工具。
+- `tests/unit/`: rewriting-logic unit tests (HTML/JS/CSS prefixing, the `Wke()` patch, path normalization, request/response header handling).
+- `tests/integration/`: end-to-end tests against a mock upstream that reproduces kimi's Host check and token auth — base-prefix rewriting, API auth, byte-identical binary passthrough, Host rewriting and the WebSocket handshake.
+- `tests/helpers/`: mock upstream + proxy subprocess launcher.
 
-## 许可
+## License
 
 MIT

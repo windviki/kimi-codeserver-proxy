@@ -66,7 +66,7 @@ const UPSTREAM_HOST = process.env.PROXY_UPSTREAM_HOST || "127.0.0.1";
 const UPSTREAM_PORT = envPort("PROXY_UPSTREAM_PORT", 58627);
 const PORT = envPort("PROXY_PORT", 3101);
 const SPAWN_KIMI = process.env.PROXY_SPAWN_KIMI !== "0";
-// Optional: set to the code-server hostname (e.g. code.aixyz.cloud) so the
+// Optional: set to the code-server hostname (e.g. code.your-host.com) so the
 // proxy can print the full clickable access URL including the auth token.
 const EXTERNAL_HOST = (process.env.PROXY_EXTERNAL_HOST || "").trim();
 const LOOPBACK_AUTHORITY = `${UPSTREAM_HOST}:${UPSTREAM_PORT}`;
