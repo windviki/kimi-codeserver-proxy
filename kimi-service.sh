@@ -44,7 +44,8 @@ die()  { info "错误：$*"; exit 1; }
 
 is_up() { curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$1/" >/dev/null 2>&1; }
 
-proxy_pids() { pgrep -f "node proxy\.js$" || true; }
+# 用绝对路径精确匹配本工程的 proxy.js，避免与 dsh 等其它 proxy 误匹配
+proxy_pids() { pgrep -f "node $SCRIPT_DIR/proxy\.js$" || true; }
 # kimi 的进程 comm 是 kimi-code（启动参数不可见），用精确进程名匹配
 kimi_pids()  { pgrep -x kimi-code || true; }
 
@@ -70,7 +71,7 @@ start() {
     info "proxy 已在运行（端口 $PROXY_PORT）"
   else
     info "启动 proxy（端口 $PROXY_PORT）…"
-    nohup node proxy.js >>"$LOG_FILE" 2>&1 &
+    nohup node "$SCRIPT_DIR/proxy.js" >>"$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
     for _ in {1..20}; do
       is_up "$PROXY_PORT" && break
@@ -105,7 +106,7 @@ stop() {
     rm -f "$PID_FILE"
   fi
   # 兜底：proxy 退出时已 kill 它 spawn 的 kimi；这里清理任何残留进程
-  pkill -f "node proxy\.js$" 2>/dev/null && info "已清理残留 proxy" || true
+  pkill -f "node $SCRIPT_DIR/proxy\.js$" 2>/dev/null && info "已清理残留 proxy" || true
   pkill -x kimi-code 2>/dev/null && info "已清理残留 kimi web" || true
 
   for _ in {1..20}; do
