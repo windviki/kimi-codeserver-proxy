@@ -6,7 +6,7 @@
 #   ./kimi-service.sh stop     停止 proxy + kimi web
 #   ./kimi-service.sh restart  重启
 #   ./kimi-service.sh status   查看状态
-#   ./kimi-service.sh url      打印 code-server 下的访问地址（含 token）
+#   ./kimi-service.sh url      打印 code-server 下的访问地址
 #   ./kimi-service.sh logs     跟踪 proxy 日志（Ctrl-C 退出）
 #
 # 说明：proxy 会自动 spawn `kimi web`（PROXY_SPAWN_KIMI 默认开启），因此本脚本
@@ -23,6 +23,9 @@ PROXY_PORT=3101
 UPSTREAM_PORT=58627
 EXTERNAL_HOST=""
 BASE="/proxy/$PROXY_PORT"
+# 与 proxy.js 的默认值保持一致：默认让 kimi web 关闭自带的 bearer 认证
+#（由 code-server 统一认证兜底），UI 不再弹 token 输入框。
+KIMI_BYPASS_AUTH=1
 if [[ -f .env ]]; then
   while IFS='=' read -r k v; do
     case "$k" in
@@ -30,6 +33,7 @@ if [[ -f .env ]]; then
       PROXY_UPSTREAM_PORT)     UPSTREAM_PORT="$v" ;;
       PROXY_EXTERNAL_HOST)     EXTERNAL_HOST="$v" ;;
       PROXY_BASE)              BASE="$v" ;;
+      PROXY_KIMI_BYPASS_AUTH)  KIMI_BYPASS_AUTH="$v" ;;
     esac
   done < .env
 fi
@@ -59,7 +63,10 @@ access_url() {
     info "未配置 PROXY_EXTERNAL_HOST，无法生成完整地址；本机地址：http://127.0.0.1:${PROXY_PORT}${BASE}/"
     return
   fi
-  if [[ -n "$tok" ]]; then
+  if [[ "$KIMI_BYPASS_AUTH" != "0" ]]; then
+    # bypass 模式下 UI 不再需要 token（proxy 会自动完成认证注入）
+    info "访问地址：https://${EXTERNAL_HOST}${BASE}/"
+  elif [[ -n "$tok" ]]; then
     info "访问地址：https://${EXTERNAL_HOST}${BASE}/#token=${tok}"
   else
     info "访问地址：https://${EXTERNAL_HOST}${BASE}/  （尚未读取到 token，请加 #token=<kimi web token>）"

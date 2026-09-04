@@ -45,6 +45,22 @@ describe("kimi-codeserver-proxy — base-path adapter behind code-server", () =>
     assert.ok(body.includes(`href="${base}/favicon.ico"`));
     assert.equal(body.includes('src="/boot.js'), false);
     assert.equal(body.includes('href="/favicon.ico"'), false);
+    // The proxy's client script (token seeding + history fix) is injected.
+    assert.ok(body.includes(`<script src="${base}/__kimi-proxy/inject.js"></script></head>`));
+  });
+
+  test("the injected client script is served by the proxy itself (never forwarded)", async () => {
+    const res = await fetch(via("/__kimi-proxy/inject.js"));
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("content-type") || "", /javascript/);
+    assert.equal(res.headers.get("cache-control"), "no-cache");
+    const body = await res.text();
+    assert.ok(body.includes("kimi-web.server-credential"));
+    assert.ok(body.includes(`ROOT=${JSON.stringify(base)}`), "history fix must know the base path");
+    assert.ok(body.includes(JSON.stringify("test-token")), "seeded token comes from PROXY_KIMI_TOKEN");
+    // It must not hit the upstream (which would 401 without auth anyway).
+    const observedBody = await (await get("/__observed__")).body;
+    assert.equal(JSON.parse(observedBody).some((r) => r.path.includes("__kimi-proxy")), false);
   });
 
   test("JS bundle has the origin-resolution patch and prefixed /assets/ refs", async () => {
@@ -53,6 +69,10 @@ describe("kimi-codeserver-proxy — base-path adapter behind code-server", () =>
     assert.ok(body.includes(`window.location.origin+"${base}"`), "Wke must append the base path");
     assert.equal(body.includes('"/assets/'), false, "no bare root-absolute /assets/ may remain");
     assert.equal(body.includes('"/favicon.ico"'), false);
+    // SPA route constants are prefixed so pushState URLs and pathname parsing
+    // stay consistent under the base path.
+    assert.ok(body.includes(`const uC="${base}/sessions/",fz="${base}/admin/sessions"`));
+    assert.ok(body.includes(`const lk="${base}/devices/"`));
   });
 
   test("CSS webfont url() refs are prefixed", async () => {
@@ -75,6 +95,14 @@ describe("kimi-codeserver-proxy — base-path adapter behind code-server", () =>
     assert.equal(status, 200);
     assert.match(type, /text\/html/);
     assert.ok(body.includes(`src="${base}/boot.js"`));
+  });
+
+  test("session deep links (reload on /sessions/<id>) serve the rewritten app", async () => {
+    const { status, type, body } = await get(`/sessions/abc-123?rc=x`);
+    assert.equal(status, 200);
+    assert.match(type, /text\/html/);
+    assert.ok(body.includes(`src="${base}/assets/index-yKYHPeXU.js"`));
+    assert.ok(body.includes(`<script src="${base}/__kimi-proxy/inject.js"></script>`));
   });
 
   test("binary assets pass through byte-identical (no buffered rewrite)", async () => {

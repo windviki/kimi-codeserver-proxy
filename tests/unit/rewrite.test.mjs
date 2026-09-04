@@ -3,10 +3,12 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import vm from "node:vm";
 
 import {
   prefixQuoted,
   patchApiBase,
+  patchRouteBase,
   rewriteHtml,
   rewriteJs,
   rewriteCss,
@@ -15,6 +17,9 @@ import {
   normalizePath,
   requestHeaders,
   responseHeaders,
+  injectClientScript,
+  clientBootScript,
+  CLIENT_SCRIPT_PATH,
 } from "../../proxy.js";
 
 const FIXTURES = fileURLToPath(new URL("../fixtures", import.meta.url));
@@ -45,8 +50,38 @@ describe("rewriteHtml — root-absolute refs in kimi's index.html", () => {
     assert.equal(out.includes(BASE + BASE), false);
   });
 
-  test("returns the body unchanged when base is /", () => {
+  test("returns the body unchanged when base is / and there is no </head>", () => {
     assert.equal(rewriteHtml('<script src="/boot.js"></script>', "/"), '<script src="/boot.js"></script>');
+  });
+
+  test("injects the proxy client script before </head> (token seeding + history fix)", async () => {
+    const html = await readFixture("index.html");
+    const out = rewriteHtml(html, BASE);
+    const tag = `<script src="${BASE}${CLIENT_SCRIPT_PATH}"></script>`;
+    assert.ok(out.includes(tag));
+    // Injected at the end of <head>, i.e. still before the deferred module
+    // bundle executes.
+    assert.ok(out.indexOf(tag) < out.indexOf("</head>"));
+    assert.ok(out.includes(`${tag}</head>`));
+  });
+
+  test("client script injection is idempotent", async () => {
+    const html = await readFixture("index.html");
+    assert.equal(rewriteHtml(rewriteHtml(html, BASE), BASE), rewriteHtml(html, BASE));
+  });
+
+  test("bodies without </head> are left alone (e.g. web app manifest)", () => {
+    const manifest = '{"name":"kimi","icons":["/assets/icon.png"]}';
+    assert.equal(injectClientScript(manifest, BASE), manifest);
+  });
+
+  test("with base / the script tag is injected root-absolute (seeding still applies)", async () => {
+    const html = await readFixture("index.html");
+    const out = rewriteHtml(html, "/");
+    assert.ok(out.includes(`<script src="${CLIENT_SCRIPT_PATH}"></script></head>`));
+    // No path prefixing happens for the root base.
+    assert.ok(out.includes('src="/boot.js"'));
+    assert.equal(out.includes('src="/proxy/'), false);
   });
 
   test("does not touch single-quoted or unquoted URL-looking text", () => {
@@ -108,6 +143,117 @@ describe("rewriteJs — bundle rewriting", () => {
     const once = rewriteJs(js, BASE);
     const twice = rewriteJs(once, BASE);
     assert.equal(twice, once);
+  });
+});
+
+describe("patchRouteBase — SPA router constants", () => {
+  test("prefixes the session/admin/device route constants in the 0.39.1 router excerpt", async () => {
+    const js = await readFixture("index.js.fixture.js");
+    const out = rewriteJs(js, BASE);
+
+    assert.ok(out.includes(`const uC="${BASE}/sessions/",fz="${BASE}/admin/sessions"`));
+    assert.ok(out.includes(`const lk="${BASE}/devices/"`));
+    // No bare route constant may survive.
+    assert.equal(out.includes('"/sessions/"'), false);
+    assert.equal(out.includes('"/admin/sessions"'), false);
+    assert.equal(out.includes('"/devices/"'), false);
+  });
+
+  test("never touches REST paths that merely look similar", async () => {
+    const js = 'const p=["/api/v1","/sessions","/sessions:archive","/devices:pair"]';
+    const out = patchRouteBase(js, BASE);
+    assert.equal(out, js);
+  });
+
+  test("is a no-op when base is /", () => {
+    const js = 'const uC="/sessions/"';
+    assert.equal(patchRouteBase(js, "/"), js);
+  });
+});
+
+describe("clientBootScript — token seeding + history prefixing", () => {
+  // Executes the generated script in a sandbox that mimics the browser
+  // globals it touches, so the assertions cover the emitted code itself.
+  function runBoot(src) {
+    const store = new Map();
+    const calls = [];
+    const sandbox = {
+      localStorage: {
+        setItem: (k, v) => store.set(k, v),
+        getItem: (k) => (store.has(k) ? store.get(k) : null),
+        removeItem: (k) => store.delete(k),
+      },
+      history: {
+        pushState: (s, t, u) => calls.push(["push", s, t, u]),
+        replaceState: (s, t, u) => calls.push(["replace", s, t, u]),
+      },
+    };
+    vm.createContext(sandbox);
+    vm.runInContext(src, sandbox);
+    return { store, history: sandbox.history, calls };
+  }
+
+  test("seeds kimi's server-credential record in the app's own shape", () => {
+    const before = Date.now();
+    const { store } = runBoot(clientBootScript(BASE, "sometoken_123"));
+    const raw = store.get("kimi-web.server-credential");
+    assert.ok(raw, "credential key must be set");
+    const record = JSON.parse(raw);
+    assert.equal(record.version, 1);
+    assert.equal(record.credential, "sometoken_123");
+    assert.ok(record.expiresAt > before, "TTL must be in the future");
+    // kimi uses a 7-day TTL (10080 minutes); allow a small delta.
+    assert.ok(record.expiresAt - before <= 10080 * 60 * 1000 + 1000);
+  });
+
+  test("prefixes root-absolute history URLs and leaves everything else", () => {
+    const { history, calls } = runBoot(clientBootScript(BASE, "t"));
+    history.pushState(null, "", "/sessions/abc");
+    history.pushState(null, "", "/"); // closing a session navigates to "/"
+    history.replaceState(null, "", `${BASE}/sessions/abc`); // already prefixed
+    history.pushState(null, "", "//evil.example/x"); // protocol-relative
+    history.pushState(null, "", "relative.html");
+    history.pushState(null, "", null);
+    assert.deepEqual(
+      calls,
+      [
+        ["push", null, "", `${BASE}/sessions/abc`],
+        ["push", null, "", `${BASE}/`],
+        ["replace", null, "", `${BASE}/sessions/abc`],
+        ["push", null, "", "//evil.example/x"],
+        ["push", null, "", "relative.html"],
+        ["push", null, "", null],
+      ],
+    );
+  });
+
+  test("without a usable token it patches history but never touches storage", () => {
+    for (const token of [null, "", "../../etc", "with space"]) {
+      const { store, history } = runBoot(clientBootScript(BASE, token));
+      history.pushState(null, "", "/sessions/x");
+      assert.equal(store.size, 0, `token ${JSON.stringify(token)} must not be seeded`);
+    }
+  });
+
+  test("with base / it still seeds the token but does not rewrite URLs", () => {
+    const { store, history, calls } = runBoot(clientBootScript("/", "t"));
+    assert.ok(store.get("kimi-web.server-credential"));
+    history.pushState(null, "", "/sessions/x");
+    assert.deepEqual(calls, [["push", null, "", "/sessions/x"]]);
+  });
+
+  test("storage failures are swallowed (the UI must still boot)", () => {
+    const sandbox = {
+      localStorage: {
+        setItem: () => {
+          throw new Error("QuotaExceededError");
+        },
+      },
+      history: { pushState() {}, replaceState() {} },
+    };
+    vm.createContext(sandbox);
+    assert.doesNotThrow(() => vm.runInContext(clientBootScript(BASE, "t"), sandbox));
+    sandbox.history.pushState(null, "", "/x");
   });
 });
 

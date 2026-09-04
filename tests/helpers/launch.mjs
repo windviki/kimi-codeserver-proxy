@@ -29,6 +29,9 @@ export function launchProxy({ proxyPort, upstreamPort, base }) {
     PROXY_UPSTREAM_PORT: String(upstreamPort),
     PROXY_SPAWN_KIMI: "0",
     PROXY_EXTERNAL_HOST: "",
+    // Pin the seeded token so tests don't depend on the host's real
+    // ~/.kimi-code/server.token.
+    PROXY_KIMI_TOKEN: "test-token",
   };
   const proc = spawn(process.execPath, [PROXY_FILE], { env, stdio: ["ignore", "pipe", "pipe"] });
   const logs = [];

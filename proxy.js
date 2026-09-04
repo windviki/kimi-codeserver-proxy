@@ -15,6 +15,14 @@
  * the DNS-rebinding fence is satisfied exactly as for a local browser.
  *
  *   browser -> code-server /proxy/<port>/ -> this proxy -> kimi web (loopback)
+ *
+ * On top of the path adaptation it also removes the token prompt for
+ * code-server deployments with unified auth: the spawned `kimi web` runs with
+ * `--dangerous-bypass-auth` (kimi natively skips its bearer gate then), and an
+ * injected client script additionally seeds the UI with the persisted token
+ * for the case where kimi runs without the flag. The same script patches
+ * history pushState/replaceState so SPA navigations never escape the base
+ * subtree.
  */
 
 import http from "node:http";
@@ -66,13 +74,23 @@ const UPSTREAM_HOST = process.env.PROXY_UPSTREAM_HOST || "127.0.0.1";
 const UPSTREAM_PORT = envPort("PROXY_UPSTREAM_PORT", 58627);
 const PORT = envPort("PROXY_PORT", 3101);
 const SPAWN_KIMI = process.env.PROXY_SPAWN_KIMI !== "0";
+// Behind code-server's unified auth the kimi-side bearer check is redundant, so
+// the proxy spawns `kimi web --dangerous-bypass-auth` by default and the UI
+// never asks for a token (kimi advertises the bypass via /api/v1/meta). Set to
+// `0` to keep kimi's own bearer auth — the injected client script then seeds the
+// UI with the known token instead (see KIMI_TOKEN_DIR / PROXY_KIMI_TOKEN).
+const KIMI_BYPASS_AUTH = process.env.PROXY_KIMI_BYPASS_AUTH !== "0";
+// Explicit token override; otherwise read from kimi's persisted token file.
+const KIMI_TOKEN = (process.env.PROXY_KIMI_TOKEN || "").trim();
+const KIMI_TOKEN_DIR = process.env.KIMI_HOME || path.join(homedir(), ".kimi-code");
 // Optional: set to the code-server hostname (e.g. code.your-host.com) so the
-// proxy can print the full clickable access URL including the auth token.
+// proxy can print the full clickable access URL.
 const EXTERNAL_HOST = (process.env.PROXY_EXTERNAL_HOST || "").trim();
 const LOOPBACK_AUTHORITY = `${UPSTREAM_HOST}:${UPSTREAM_PORT}`;
 
 // The auth token kimi web prints at startup (also persisted to
-// ~/.kimi-code/server.token). Captured only when this proxy spawns kimi.
+// ~/.kimi-code/server.token). Captured only when this proxy spawns kimi; the
+// persisted file is the primary source, this is the fallback.
 let kimiToken = null;
 
 // ---------------------------------------------------------------------------
@@ -139,27 +157,36 @@ export function patchApiBase(s, base) {
   if (WKE_PATCH_RE.test(s)) {
     return s.replace(WKE_PATCH_RE, `$1+"${base}"$2`);
   }
-  console.warn(
-    `[kimi-codeserver-proxy] WARN: the kimi web bundle's origin-resolution pattern was not found, ` +
-      `so the API/WS base path is not rewritten. If the UI loads but API/WS calls fail, open it with ` +
+  warnOnce(
+    "wke",
+    "the kimi web bundle's origin-resolution pattern was not found in a JS response, " +
+      "so the API/WS base path is not rewritten there. Boot scripts and lazy chunks never match; " +
+      "this only breaks the UI if the main app bundle no longer matches, in which case open it with " +
       `?kimi_origin=<code-server base URL> or upgrade this proxy for the current kimi bundle.`,
   );
   return s;
 }
 
 export function rewriteHtml(body, base) {
-  if (base === "/") return body;
-  return prefixQuoted(body, base, '"', HTML_TARGETS);
+  let out = body;
+  if (base !== "/") out = prefixQuoted(out, base, '"', HTML_TARGETS);
+  // The bootstrap script fixes the token prompt and stray "/" navigations and
+  // must be present for every base (including "/" — the token seeding still
+  // applies). It is harmless inside a manifest JSON: no </head> to inject at.
+  return injectClientScript(out, base);
 }
 
 export function rewriteJs(body, base) {
   if (base === "/") return body;
   // First patch the origin-resolution expression so the REST/WS base becomes
-  // `window.location.origin + base`, then prefix the root-absolute asset
-  // references that live in the bundle (KaTeX/mermaid workers and rive
-  // animations). Lazy chunks are referenced relative to the module URL, so
-  // they need no rewrite and are unaffected by these exact-path replacements.
+  // `window.location.origin + base`, then the SPA route constants so pushState
+  // URLs and pathname parsing agree under the base path, then prefix the
+  // root-absolute asset references that live in the bundle (KaTeX/mermaid
+  // workers and rive animations). Lazy chunks are referenced relative to the
+  // module URL, so they need no rewrite and are unaffected by these
+  // exact-path replacements.
   let s = patchApiBase(body, base);
+  s = patchRouteBase(s, base);
   s = prefixQuoted(s, base, '"', ["/assets/"]);
   s = prefixQuoted(s, base, "'", ["/assets/"]);
   return s;
@@ -188,6 +215,94 @@ export function rewriteBody(body, base, contentType) {
   if (type.includes("text/html") || type.includes("application/manifest+json")) return rewriteHtml(body, base);
   if (type.includes("text/css")) return rewriteCss(body, base);
   return rewriteJs(body, base);
+}
+
+// ---------------------------------------------------------------------------
+// Client bootstrap script (pure, exported for tests)
+// ---------------------------------------------------------------------------
+// The proxy serves one generated script and injects it into every HTML page
+// (a classic <script> in <head>, so it always runs before the deferred module
+// bundle). It solves the two things that cannot be fixed by byte-rewriting
+// upstream assets alone:
+//
+// 1. Token seeding. The UI asks for the server token when localStorage holds
+//    no valid `kimi-web.server-credential`. Seeding that key with the known
+//    token — in exactly the app's own record shape ({version, credential,
+//    expiresAt}, 7-day TTL, refreshed on every page load) — is equivalent to
+//    opening the UI with `#token=…`, so no token prompt ever appears.
+// 2. History URL prefixing. The router pushes root-absolute URLs (and the
+//    literal "/" when closing a session); patching pushState/replaceState
+//    keeps those inside the forwarded subtree even where the bundle-level
+//    route patch below has no matching constant.
+
+export const CLIENT_SCRIPT_PATH = "/__kimi-proxy/inject.js";
+const CREDENTIAL_KEY = "kimi-web.server-credential";
+
+export function clientBootScript(base, token) {
+  const root = base === "/" ? "" : base;
+  const cred = token && /^[A-Za-z0-9_-]+$/.test(token) ? token : null;
+  return `(function(){
+"use strict";
+var ROOT=${JSON.stringify(root)},TOKEN=${JSON.stringify(cred)};
+try{
+if(TOKEN&&typeof localStorage<"u"){
+localStorage.setItem(${JSON.stringify(CREDENTIAL_KEY)},JSON.stringify({version:1,credential:TOKEN,expiresAt:Date.now()+10080*60*1000}));
+}
+}catch{}
+try{
+var push=history.pushState,replace=history.replaceState;
+function fix(u){
+if(typeof u!=="string"||u===""||u.charAt(0)!=="/"||u.charAt(1)==="/")return u;
+if(ROOT===""||u===ROOT||u.lastIndexOf(ROOT+"/",0)===0)return u;
+return ROOT+u;
+}
+history.pushState=function(s,t,u){return push.call(history,s,t,u==null?u:fix(u))};
+history.replaceState=function(s,t,u){return replace.call(history,s,t,u==null?u:fix(u))};
+}catch{}
+})();`;
+}
+
+export function injectClientScript(body, base) {
+  if (!body.includes("</head>")) return body;
+  const src = `${base === "/" ? "" : base}${CLIENT_SCRIPT_PATH}`;
+  const tag = `<script src="${src}"></script>`;
+  if (body.includes(tag)) return body;
+  return body.replace("</head>", `${tag}</head>`);
+}
+
+// ---------------------------------------------------------------------------
+// SPA route patch (pure, exported for tests)
+// ---------------------------------------------------------------------------
+// kimi's router builds AND parses its history URLs from module-level route
+// constants (present verbatim in the 0.37.2 and 0.39.1 bundles):
+//   "/sessions/"       session view
+//   "/admin/sessions"  session admin list
+//   "/devices/"        remote-control pairing
+// Prefixing the constants keeps pushState URLs and location.pathname parsing
+// consistent, so the URL stays under the base path and a reload restores the
+// same view. The REST client uses "/sessions" (no trailing slash) and similar
+// server paths — those are appended to the API base at runtime and must NOT
+// be touched, which the trailing-slash / full-value match guarantees.
+const ROUTE_CONSTANTS = ["/sessions/", "/admin/sessions", "/devices/"];
+
+export function patchRouteBase(body, base) {
+  if (base === "/") return body;
+  let out = body;
+  for (const route of ROUTE_CONSTANTS) {
+    const target = `"${route}"`;
+    if (out.includes(target)) out = out.split(target).join(`"${base}${route}"`);
+  }
+  return out;
+}
+
+// Warn at most once per process per missing pattern: rewriteJs runs on every
+// JS response (boot.js, workers, lazy chunks) and most of them legitimately
+// contain none of the patched patterns.
+const warnedPatterns = new Set();
+function warnOnce(key, message) {
+  if (warnedPatterns.has(key)) return;
+  warnedPatterns.add(key);
+  console.warn(`[kimi-codeserver-proxy] WARN: ${message}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -233,7 +348,23 @@ export function responseHeaders(headers) {
 
 // Expose the resolved config so the service script / tests can read it back.
 export function config() {
-  return { BASE, PORT, UPSTREAM_HOST, UPSTREAM_PORT, SPAWN_KIMI, EXTERNAL_HOST };
+  return { BASE, PORT, UPSTREAM_HOST, UPSTREAM_PORT, SPAWN_KIMI, KIMI_BYPASS_AUTH, EXTERNAL_HOST };
+}
+
+// The kimi web token: explicit override, else kimi's persisted token file
+// (written by kimi itself, survives restarts), else the token captured from a
+// kimi this proxy spawned. Re-read per request so a `kimi rotate-token` is
+// picked up on the next page load. Returns null when nothing usable is found;
+// the client script then skips seeding (same UX as before this proxy existed).
+function resolveKimiToken() {
+  if (KIMI_TOKEN) return KIMI_TOKEN;
+  try {
+    const raw = readFileSync(path.join(KIMI_TOKEN_DIR, "server.token"), "utf8").trim();
+    if (/^[A-Za-z0-9_-]+$/.test(raw)) return raw;
+  } catch {
+    // no readable token file — fall through
+  }
+  return kimiToken;
 }
 
 function sendUpstreamError(res, err) {
@@ -251,6 +382,22 @@ function sendUpstreamError(res, err) {
 
 function forward(req, res) {
   const targetPath = normalizePath(req.url);
+
+  if (req.method === "GET" && targetPath === CLIENT_SCRIPT_PATH) {
+    res.on("error", () => {});
+    if (res.destroyed) return;
+    const body = Buffer.from(clientBootScript(BASE, resolveKimiToken()));
+    res.writeHead(200, {
+      "content-type": "text/javascript; charset=utf-8",
+      // Must revalidate: the seeded token follows kimi's server.token and the
+      // TTL is anchored to Date.now() at serve time.
+      "cache-control": "no-cache",
+      "content-length": String(body.length),
+    });
+    res.end(body);
+    return;
+  }
+
   const headers = requestHeaders(req.headers);
 
   const upstream = http.request(
@@ -387,31 +534,58 @@ function captureToken(line) {
 }
 
 let kimiChild = null;
+let kimiSpawnCount = 0;
+let kimiOutput = "";
 
-async function ensureUpstream() {
-  if (!SPAWN_KIMI) return;
-  if (await upstreamReady()) return;
+function spawnKimi(useBypass) {
   const kimiBin = findKimiBin();
-  console.log(
-    `[kimi-codeserver-proxy] upstream not running, spawning '${kimiBin} web --port ${UPSTREAM_PORT} --no-open'`,
-  );
-  const child = spawn(kimiBin, ["web", "--port", String(UPSTREAM_PORT), "--no-open"], {
+  const args = ["web", "--port", String(UPSTREAM_PORT), "--no-open"];
+  if (useBypass) args.push("--dangerous-bypass-auth");
+  console.log(`[kimi-codeserver-proxy] spawning '${kimiBin} ${args.join(" ")}'`);
+  const child = spawn(kimiBin, args, {
     stdio: ["ignore", "pipe", "pipe"],
   });
   kimiChild = child;
+  kimiSpawnCount++;
   const sink = (d) => {
     const text = d.toString();
+    if (kimiOutput.length < 65536) kimiOutput += text;
     process.stdout.write(`[kimi] ${text}`);
     for (const line of text.split("\n")) captureToken(line);
   };
   child.stdout.on("data", sink);
-  child.stderr.on("data", (d) => process.stderr.write(`[kimi] ${d}`));
+  child.stderr.on("data", (d) => {
+    if (kimiOutput.length < 65536) kimiOutput += d.toString();
+    process.stderr.write(`[kimi] ${d}`);
+  });
   child.on("exit", (code) => {
     if (kimiChild === child) kimiChild = null;
-    if (code !== null && code !== 0) console.error(`[kimi-codeserver-proxy] kimi web exited with code ${code}`);
+    if (code !== null && code !== 0) {
+      console.error(`[kimi-codeserver-proxy] kimi web exited with code ${code}`);
+      // Older kimi builds predate --dangerous-bypass-auth and die with an
+      // unknown-option error; retry once without the flag so the proxy still
+      // comes up (the injected client script then carries the token).
+      if (
+        useBypass &&
+        kimiSpawnCount === 1 &&
+        /dangerous-bypass-auth|unknown option|unexpected argument|unrecognized option/i.test(kimiOutput)
+      ) {
+        console.warn("[kimi-codeserver-proxy] kimi rejected --dangerous-bypass-auth; retrying without it");
+        spawnKimi(false);
+      }
+    }
   });
+}
+
+async function ensureUpstream() {
+  if (!SPAWN_KIMI) return;
+  if (await upstreamReady()) return;
+  spawnKimi(KIMI_BYPASS_AUTH);
   for (let i = 0; i < 40; i++) {
     if (await upstreamReady()) return;
+    // kimiChild is nulled synchronously in the exit handler (after any retry
+    // spawn), so null here means the spawn failed for good — stop waiting.
+    if (kimiChild === null) break;
     await new Promise((r) => setTimeout(r, 500));
   }
   console.error("[kimi-codeserver-proxy] upstream did not become ready; continuing anyway");
@@ -446,10 +620,15 @@ if (isMain) {
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`[kimi-codeserver-proxy] listening on ${PORT}; access through ${BASE}/ on code-server`);
     console.log(`[kimi-codeserver-proxy] forwarding to ${UPSTREAM_HOST}:${UPSTREAM_PORT}`);
-    if (EXTERNAL_HOST && kimiToken) {
-      console.log(`[kimi-codeserver-proxy] access: https://${EXTERNAL_HOST}${BASE}/#token=${kimiToken}`);
-    } else if (EXTERNAL_HOST) {
-      console.log(`[kimi-codeserver-proxy] access: https://${EXTERNAL_HOST}${BASE}/  (add #token=<kimi web token> from kimi's startup output)`);
+    if (EXTERNAL_HOST) {
+      console.log(`[kimi-codeserver-proxy] access: https://${EXTERNAL_HOST}${BASE}/`);
+    }
+    if (!KIMI_BYPASS_AUTH) {
+      console.log(
+        "[kimi-codeserver-proxy] kimi-side bearer auth is on; the UI is seeded with the token from " +
+          `${KIMI_TOKEN_DIR}/server.token (PROXY_KIMI_TOKEN overrides) — set PROXY_KIMI_BYPASS_AUTH=1 ` +
+          "to rely on code-server's auth alone",
+      );
     }
   });
 }
