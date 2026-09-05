@@ -171,6 +171,37 @@ describe("patchRouteBase — SPA router constants", () => {
   });
 });
 
+describe("kimi 0.41.0 bundle excerpts (index-CiHMlsuo.js)", () => {
+  // 0.41.0 renamed every minified identifier (Wke→Yvt, uC/fz/lk→HC/pj/jk)
+  // but kept the patched expressions byte-identical, so all rewrites must
+  // keep matching without any proxy change.
+  test("patches the renamed origin-resolution fn (Yvt) exactly like Wke", async () => {
+    const js = await readFixture("index.js.fixture.js");
+    const out = rewriteJs(js, BASE);
+
+    const yvt = out.slice(out.indexOf("function Yvt()"), out.indexOf("function Yvt()") + 200);
+    assert.ok(yvt.includes(`window.location.origin+"${BASE}"`));
+    assert.ok(yvt.includes('"http://127.0.0.1:58627"'));
+  });
+
+  test("prefixes the renamed route constants (HC/pj/jk)", async () => {
+    const js = await readFixture("index.js.fixture.js");
+    const out = rewriteJs(js, BASE);
+
+    assert.ok(out.includes(`const HC="${BASE}/sessions/",pj="${BASE}/admin/sessions"`));
+    assert.ok(out.includes(`const jk="${BASE}/devices/"`));
+  });
+
+  test("keeps the runtime-appended WS path in the template literal", async () => {
+    const js = await readFixture("index.js.fixture.js");
+    const out = rewriteJs(js, BASE);
+
+    // `${e}/api/v1/ws` is appended to the (patched) origin at runtime and is
+    // not a quoted value, so it must survive untouched.
+    assert.ok(out.includes("`${e}/api/v1/ws`"));
+  });
+});
+
 describe("clientBootScript — token seeding + history prefixing", () => {
   // Executes the generated script in a sandbox that mimics the browser
   // globals it touches, so the assertions cover the emitted code itself.
