@@ -12,6 +12,11 @@
 # 说明：proxy 会自动 spawn `kimi web`（PROXY_SPAWN_KIMI 默认开启），因此本脚本
 # 只直接管理 proxy 进程；stop 时 proxy 会带掉它 spawn 的 kimi，脚本再做一次兜底
 # 清理，保证两个服务都停止。
+#
+# 进程托管：start 用 setsid 启动 proxy —— 自建会话/进程组、脱离控制终端与父进程，
+# 父 shell 退出或其所在会话被清理时不会被连带杀死（kimi web 是 proxy 的子进程，
+# 一并受保护）。start 同时剥掉父环境里残留的 PROXY_* 变量，保证 .env 是本服务
+# 唯一配置源。
 
 set -u
 
@@ -78,13 +83,27 @@ start() {
     info "proxy 已在运行（端口 $PROXY_PORT）"
   else
     info "启动 proxy（端口 $PROXY_PORT）…"
-    nohup node "$SCRIPT_DIR/proxy.js" >>"$LOG_FILE" 2>&1 &
+    # setsid：自建会话/进程组并脱离控制终端，父 shell 退出或其会话被清理时
+    # 不会被连带杀死；无 setsid 的环境退化为 nohup（同样屏蔽 SIGHUP）。
+    # env -u：剥掉父环境里残留的 PROXY_* 变量（proxy 规定真实环境变量优先于
+    # .env，外部注入会把 BASE/PORT/上游端口改乱），保证 .env 是本服务唯一配置源。
+    local launcher=(nohup node)
+    if command -v setsid >/dev/null 2>&1; then launcher=(setsid nohup node); fi
+    env -u PROXY_BASE -u PROXY_PORT -u PROXY_UPSTREAM_HOST \
+        -u PROXY_UPSTREAM_PORT -u PROXY_SPAWN_KIMI -u PROXY_KIMI_BYPASS_AUTH \
+        -u PROXY_EXTERNAL_HOST \
+        "${launcher[@]}" "$SCRIPT_DIR/proxy.js" >>"$LOG_FILE" 2>&1 < /dev/null &
     echo $! > "$PID_FILE"
-    for _ in {1..20}; do
+    for _ in {1..90}; do
       is_up "$PROXY_PORT" && break
       sleep 0.5
     done
     is_up "$PROXY_PORT" || die "proxy 未就绪，请查看 $LOG_FILE"
+    # setsid 在少数环境（自身已是进程组组长）会 fork 出真正的服务进程，$! 记录的
+    # 可能只是中间进程；就绪后用精确 pgrep 把真实 PID 写回，stop 时不会杀错。
+    local real
+    real="$(proxy_pids | head -1)"
+    [[ -n "$real" ]] && echo "$real" > "$PID_FILE"
     info "proxy 就绪（pid $(cat "$PID_FILE")）"
   fi
 
@@ -108,18 +127,45 @@ start() {
 
 stop() {
   info "停止 proxy…"
-  if [[ -s "$PID_FILE" ]]; then
-    kill "$(cat "$PID_FILE")" 2>/dev/null && info "已向 proxy 发送 SIGTERM" || true
-    rm -f "$PID_FILE"
+  local pid="" p c
+  if [[ -s "$PID_FILE" ]]; then pid="$(cat "$PID_FILE")"; fi
+  [[ -z "$pid" ]] && pid="$(proxy_pids | head -1)"
+
+  # 先按父子关系精准停掉 proxy spawn 的 kimi web：正常路径下不依赖 proxy 的退出
+  # 处理，proxy 被 SIGKILL 时也不会留下孤儿占着上游端口。注意不要无条件执行
+  # `pkill -x kimi-code` —— 交互式 kimi CLI 会话的进程名同样是 kimi-code。
+  for p in $(proxy_pids); do
+    for c in $(pgrep -P "$p" 2>/dev/null || true); do
+      [[ "$(cat "/proc/$c/comm" 2>/dev/null || true)" == "kimi-code" ]] || continue
+      kill "$c" 2>/dev/null && info "已停止 kimi web（pid $c）" || true
+    done
+  done
+
+  if [[ -n "$pid" ]]; then
+    kill "$pid" 2>/dev/null && info "已向 proxy 发送 SIGTERM" || true
   fi
-  # 兜底：proxy 退出时已 kill 它 spawn 的 kimi；这里清理任何残留进程
+  rm -f "$PID_FILE"
+  # 兜底：只清理精确匹配本工程 proxy.js 的残留进程
   pkill -f "node $SCRIPT_DIR/proxy\.js$" 2>/dev/null && info "已清理残留 proxy" || true
-  pkill -x kimi-code 2>/dev/null && info "已清理残留 kimi web" || true
 
   for _ in {1..20}; do
     ! is_up "$PROXY_PORT" && ! is_up "$UPSTREAM_PORT" && break
     sleep 0.5
   done
+
+  # 上游端口仍被占用 = 有孤儿 kimi web（proxy 未走正常退出路径时）。只杀真正
+  # 占用该端口的进程；fuser 不可用时才退回进程名匹配。
+  if is_up "$UPSTREAM_PORT"; then
+    local holders
+    holders="$(fuser -n tcp "$UPSTREAM_PORT" 2>/dev/null | sed 's/^[^:]*://' | tr -s ' ' '\n' | grep -E '^[0-9]+$' || true)"
+    if [[ -n "$holders" ]]; then
+      for c in $holders; do
+        kill "$c" 2>/dev/null && info "已清理占用端口 $UPSTREAM_PORT 的残留进程（pid $c）" || true
+      done
+    else
+      pkill -x kimi-code 2>/dev/null && info "已清理残留 kimi web" || true
+    fi
+  fi
   info "已停止"
 }
 
